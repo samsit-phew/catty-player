@@ -7,6 +7,7 @@ use rand::thread_rng;
 
 /// Player state management
 pub struct PlayerState {
+    #[allow(non_snake_case)]
     pub loopC: bool,
     // Search UI state
     pub search_mode: bool,
@@ -313,15 +314,14 @@ impl PlayerState {
     /// Seek forward by 10 seconds
     pub fn seek_forward(&mut self) {
         let current = self.audio.get_elapsed_millis();
-        let new_pos = current + 10_000; // 10 seconds in milliseconds
-        self.audio.set_elapsed_millis(new_pos);
+        let new_pos = current + 10_000;
+        self.audio.seek_to(new_pos).unwrap(); // <- updated
     }
 
-    /// Seek backward by 10 seconds
     pub fn seek_backward(&mut self) {
         let current = self.audio.get_elapsed_millis();
-        let new_pos = current.saturating_sub(10_000); // 10 seconds in milliseconds
-        self.audio.set_elapsed_millis(new_pos);
+        let new_pos = current.saturating_sub(10_000);
+        self.audio.seek_to(new_pos).unwrap(); // <- updated
     }
 
     /// Toggle help menu visibility

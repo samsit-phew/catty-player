@@ -1,9 +1,9 @@
 use anyhow::Result;
 use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink, Source};
 use std::io::{BufReader, Cursor};
-use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -17,11 +17,13 @@ pub fn get_system_volume() -> f32 {
     {
         Ok(output) => {
             if let Ok(s) = String::from_utf8(output.stdout) {
-                // Output format: "Volume: front-left: 21870 / 33% / 0.13 dB   front-right: 21870 / 33% / 0.13 dB"
-                // Extract percentage value
-                if let Some(pct_str) = s.split('%').next().and_then(|p| p.split_whitespace().last()) {
+                if let Some(pct_str) = s
+                    .split('%')
+                    .next()
+                    .and_then(|p| p.split_whitespace().last())
+                {
                     if let Ok(pct) = pct_str.parse::<f32>() {
-                        return (pct / 100.0).min(1.0).max(0.0);
+                        return (pct / 100.0).clamp(0.0, 1.0);
                     }
                 }
             }
@@ -29,9 +31,8 @@ pub fn get_system_volume() -> f32 {
         Err(_) => {}
     }
 
-    1.0 // Default to 100% if pactl unavailable
+    1.0 // default
 }
-
 
 /// Audio player using rodio with sample capturing for visualization
 pub struct AudioPlayer {
@@ -42,16 +43,16 @@ pub struct AudioPlayer {
     sample_buffer: Arc<Mutex<Vec<f32>>>,
     elapsed_millis: Arc<AtomicU64>,
     start_time: Arc<Mutex<Option<Instant>>>,
-    #[allow(dead_code)]
     pause_elapsed: Arc<AtomicU64>,
+    current_track: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl AudioPlayer {
-    /// Create a new audio player
+    /// Create a new player
     pub fn new() -> Result<Self> {
         let (stream, stream_handle) = OutputStream::try_default()?;
         let sink = Sink::try_new(&stream_handle)?;
-        
+
         Ok(Self {
             _stream: stream,
             stream_handle,
@@ -61,53 +62,47 @@ impl AudioPlayer {
             elapsed_millis: Arc::new(AtomicU64::new(0)),
             start_time: Arc::new(Mutex::new(None)),
             pause_elapsed: Arc::new(AtomicU64::new(0)),
+            current_track: Arc::new(Mutex::new(None)),
         })
     }
 
-    /// Play a track from file path
+    /// Play a track
     pub fn play(&self, path: &Path) -> Result<()> {
-        // Read file bytes into memory so we can create two independent decoders:
-        // one for playback and one for extracting samples for the visualizer.
         let data = std::fs::read(path)?;
 
-        // Playback decoder (convert to f32 samples)
-        let playback_cursor = Cursor::new(data.clone());
-        let playback_decoder = Decoder::new(BufReader::new(playback_cursor))?.convert_samples::<f32>();
+        // Store current track path
+        *self.current_track.lock().unwrap() = Some(path.to_path_buf());
 
-        // Visualization decoder (separate reader so we don't consume playback samples)
+        // Playback decoder
+        let playback_cursor = Cursor::new(data.clone());
+        let playback_decoder =
+            Decoder::new(BufReader::new(playback_cursor))?.convert_samples::<f32>();
+
+        // Visualization decoder
         let vis_cursor = Cursor::new(data);
         let mut vis_decoder = Decoder::new(BufReader::new(vis_cursor))?.convert_samples::<f32>();
 
-        // Store duration if available (from playback decoder)
-        // Note: convert_samples() returns an adapter that still exposes total_duration()
-        let duration = playback_decoder.total_duration();
-        *self.current_duration.lock().unwrap() = duration;
+        // Duration
+        *self.current_duration.lock().unwrap() = playback_decoder.total_duration();
 
-        // Reset elapsed time and set start time
         self.elapsed_millis.store(0, Ordering::Relaxed);
         *self.start_time.lock().unwrap() = Some(Instant::now());
 
-        // Stop previous sink and replace with a new one for playback
-        let sink = self.sink.lock().unwrap();
-        sink.stop();
-        drop(sink);
-
+        // Stop old sink
+        self.sink.lock().unwrap().stop();
         let new_sink = Sink::try_new(&self.stream_handle)?;
         new_sink.append(playback_decoder);
         new_sink.play();
         *self.sink.lock().unwrap() = new_sink;
 
-        // Spawn a background thread to consume the visualization decoder at roughly
-        // the audio playback rate and push mono f32 samples into sample_buffer.
+        // Background thread for visualizer
         let sample_buffer = Arc::clone(&self.sample_buffer);
         thread::spawn(move || {
             let channels = vis_decoder.channels() as usize;
             let sample_rate = vis_decoder.sample_rate();
+            let chunk_frames = 1024;
 
-            // We'll read in small chunks and sleep to approximate real-time
-            let chunk_frames = 1024usize; // frames per chunk (per-channel frames)
             loop {
-                // Collect up to chunk_frames * channels samples
                 let mut tmp = Vec::with_capacity(chunk_frames * channels);
                 for _ in 0..(chunk_frames * channels) {
                     if let Some(s) = vis_decoder.next() {
@@ -116,75 +111,99 @@ impl AudioPlayer {
                         break;
                     }
                 }
-
                 if tmp.is_empty() {
-                    break; // finished
+                    break;
                 }
 
-                // Convert to mono by averaging channels if necessary
-                if channels > 1 {
+                // convert to mono
+                let mono = if channels > 1 {
                     let frames = tmp.len() / channels;
                     let mut mono = Vec::with_capacity(frames);
                     for frame_idx in 0..frames {
-                        let mut sum = 0.0f32;
-                        for ch in 0..channels {
-                            sum += tmp[frame_idx * channels + ch];
-                        }
+                        let sum: f32 = (0..channels).map(|ch| tmp[frame_idx * channels + ch]).sum();
                         mono.push(sum / channels as f32);
                     }
-
-                    let mut buf = sample_buffer.lock().unwrap();
-                    buf.extend_from_slice(&mono);
-                    if buf.len() > 8192 {
-                        buf.drain(..4096);
-                    }
+                    mono
                 } else {
-                    let mut buf = sample_buffer.lock().unwrap();
-                    buf.extend_from_slice(&tmp);
-                    if buf.len() > 8192 {
-                        buf.drain(..4096);
-                    }
+                    tmp
+                };
+
+                let mut buf = sample_buffer.lock().unwrap();
+                buf.extend_from_slice(&mono);
+                if buf.len() > 8192 {
+                    buf.drain(..4096);
                 }
 
-                // Sleep for approximately chunk_frames / sample_rate seconds
-                if sample_rate > 0 {
-                    let secs = (chunk_frames as f32) / (sample_rate as f32);
-                    let millis = (secs * 1000.0) as u64;
-                    thread::sleep(Duration::from_millis(millis));
-                } else {
-                    // fallback small sleep
-                    thread::sleep(Duration::from_millis(10));
-                }
+                let sleep_ms = ((chunk_frames as f32 / sample_rate as f32) * 1000.0) as u64;
+                thread::sleep(Duration::from_millis(sleep_ms.max(10)));
             }
         });
 
         Ok(())
     }
 
-    /// Get sample buffer for visualization
-    pub fn get_sample_buffer(&self) -> Arc<Mutex<Vec<f32>>> {
-        Arc::clone(&self.sample_buffer)
+    /// Seek to specific position
+    pub fn seek_to(&self, millis: u64) -> Result<()> {
+        if let Some(duration) = *self.current_duration.lock().unwrap() {
+            let target = millis.min(duration.as_millis() as u64);
+
+            // Stop current sink
+            self.sink.lock().unwrap().stop();
+
+            // Recreate decoder
+            if let Some(track_path) = &*self.current_track.lock().unwrap() {
+                let data = std::fs::read(track_path)?;
+                let cursor = Cursor::new(data);
+                let mut decoder = Decoder::new(cursor)?.convert_samples::<f32>();
+
+                // skip samples
+                let sample_rate = decoder.sample_rate() as u64;
+                let channels = decoder.channels() as u64;
+                let frames_to_skip = (target * sample_rate) / 1000;
+                let samples_to_skip = frames_to_skip * channels;
+                for _ in 0..samples_to_skip {
+                    if decoder.next().is_none() {
+                        break;
+                    }
+                }
+
+                let new_sink = Sink::try_new(&self.stream_handle)?;
+                new_sink.append(decoder);
+                new_sink.play();
+                *self.sink.lock().unwrap() = new_sink;
+
+                self.elapsed_millis.store(target, Ordering::Relaxed);
+                *self.start_time.lock().unwrap() =
+                    Some(Instant::now() - Duration::from_millis(target));
+            }
+        }
+        Ok(())
     }
 
-    /// Pause playback
+    /// Seek forward/backward
+    pub fn seek_forward(&self) -> Result<()> {
+        let current = self.get_elapsed_millis();
+        self.seek_to(current + 10_000)
+    }
+
+    pub fn seek_backward(&self) -> Result<()> {
+        let current = self.get_elapsed_millis();
+        self.seek_to(current.saturating_sub(10_000))
+    }
+
+    /// Pause/resume/stop
     pub fn pause(&self) {
-        // Capture the current elapsed time before pausing
-        let elapsed = self.get_elapsed_millis();
-        self.pause_elapsed.store(elapsed, Ordering::Relaxed);
+        self.pause_elapsed
+            .store(self.get_elapsed_millis(), Ordering::Relaxed);
         self.sink.lock().unwrap().pause();
     }
 
-    /// Resume playback
     pub fn resume(&self) {
-        // Resume from the frozen position
-        let frozen_elapsed = self.pause_elapsed.load(Ordering::Relaxed);
-        let now = Instant::now();
-        let adjusted_start = now - Duration::from_millis(frozen_elapsed);
-        *self.start_time.lock().unwrap() = Some(adjusted_start);
+        let frozen = self.pause_elapsed.load(Ordering::Relaxed);
+        *self.start_time.lock().unwrap() = Some(Instant::now() - Duration::from_millis(frozen));
         self.sink.lock().unwrap().play();
     }
 
-    /// Stop playback
     pub fn stop(&self) {
         self.sink.lock().unwrap().stop();
         self.sample_buffer.lock().unwrap().clear();
@@ -192,14 +211,11 @@ impl AudioPlayer {
         *self.start_time.lock().unwrap() = None;
     }
 
-    /// Get elapsed time in milliseconds (wall-clock based, stops when paused)
+    /// Utilities
     pub fn get_elapsed_millis(&self) -> u64 {
-        // If paused, return the frozen elapsed time
         if self.sink.lock().unwrap().is_paused() {
             return self.pause_elapsed.load(Ordering::Relaxed);
         }
-        
-        // Otherwise calculate from start time
         if let Some(start) = *self.start_time.lock().unwrap() {
             start.elapsed().as_millis() as u64
         } else {
@@ -207,39 +223,23 @@ impl AudioPlayer {
         }
     }
 
-    /// Set elapsed time in milliseconds (for seeking)
-    pub fn set_elapsed_millis(&self, millis: u64) {
-        // Reset start time to now minus the desired elapsed time
-        let now = Instant::now();
-        let adjusted_start = now - Duration::from_millis(millis);
-        *self.start_time.lock().unwrap() = Some(adjusted_start);
+    pub fn get_sample_buffer(&self) -> Arc<Mutex<Vec<f32>>> {
+        Arc::clone(&self.sample_buffer)
     }
 
-    /// Check if player is paused
-    #[allow(dead_code)]
-    pub fn is_paused(&self) -> bool {
-        self.sink.lock().unwrap().is_paused()
-    }
-
-    /// Check if player is empty (finished playing)
-    pub fn is_empty(&self) -> bool {
-        self.sink.lock().unwrap().empty()
-    }
-
-    /// Set volume (0.0 to 1.0)
     pub fn set_volume(&self, volume: f32) {
         self.sink.lock().unwrap().set_volume(volume);
     }
 
-    /// Get current volume
-    #[allow(dead_code)]
-    pub fn get_volume(&self) -> f32 {
-        self.sink.lock().unwrap().volume()
-    }
-
-    /// Get current track duration
-    #[allow(dead_code)]
     pub fn get_duration(&self) -> Option<Duration> {
         *self.current_duration.lock().unwrap()
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.sink.lock().unwrap().is_paused()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sink.lock().unwrap().empty()
     }
 }
