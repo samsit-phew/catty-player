@@ -101,7 +101,7 @@ impl Default for KeybindConfig {
 impl Default for VisualizerConfig {
     fn default() -> Self {
         Self {
-            bar_count: 50,
+            bar_count: 100,
             smoothing: 0.7,
         }
     }
