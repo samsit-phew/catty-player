@@ -1,0 +1,27 @@
+[package]
+name = "catty-player"
+version = "0.1.4"
+edition = "2021"
+authors = ["samsit-phew <samsitkarki@gmail.com>"]
+description= "audio player in your terminal"
+repository = "https://www.github.com/samsit-phew/Catty"
+license="Apache-2.0"
+
+
+[dependencies]
+crossterm = "0.28"
+dirs = "5.0"
+ratatui = "0.28"
+rodio = "0.19"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+symphonia = { version = "0.5", features = ["all"] }
+walkdir = "2.5"
+tokio = { version = "1.40", features = ["full"] }
+anyhow = "1.0"
+rand = "0.8"
+toml = "0.8"
+
+rustfft = "6.2"
+cpal = "0.15"
+shellexpand = "3.1.1"
