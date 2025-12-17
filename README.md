@@ -1,6 +1,6 @@
 # Catty-player — Terminal Music Player
 
-Catty is a compact terminal music player with a visualizer, playlist, and an extensible UI.
+Catty is a compact terminal music player with a visualizer, playlist, and an extensible UI.(that im sure ya wont like lol)
 
 Quickstart
 
